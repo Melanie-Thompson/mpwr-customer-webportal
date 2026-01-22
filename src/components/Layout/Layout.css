@@ -9,7 +9,7 @@
 .app-main {
   flex: 1;
   padding: 16px;
-  padding-bottom: calc(120px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: calc(500px + env(safe-area-inset-bottom, 0px));
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
