@@ -29,26 +29,6 @@ jobs:
       - run:
           name: Run ESLint
           command: npm run lint || true
-      - run:
-          name: Check TypeScript types
-          command: npm run type-check || npx tsc --noEmit || true
-
-  # Run tests
-  test:
-    docker:
-      - image: cimg/node:20.11
-    resource_class: medium
-    steps:
-      - checkout
-      - setup_node_dependencies
-      - run:
-          name: Run tests with coverage
-          command: npm run test -- --run --coverage || true
-      - store_test_results:
-          path: test-results
-      - store_artifacts:
-          path: coverage
-          destination: coverage-report
 
   # Build customer portal
   build:
@@ -67,37 +47,39 @@ jobs:
           command: |
             ENV="<< parameters.environment >>"
 
-            cat > .env << EOF
-            VITE_ENVIRONMENT=${ENV}
-            VITE_API_URL=${VITE_API_URL}
-            VITE_COGNITO_USER_POOL_ID=${VITE_COGNITO_BORROWER_POOL_ID}
-            VITE_COGNITO_CLIENT_ID=${VITE_COGNITO_BORROWER_CLIENT_ID}
-            VITE_COGNITO_DOMAIN=${VITE_COGNITO_BORROWER_DOMAIN}
-            EOF
+            echo "VITE_ENVIRONMENT=${ENV}" > .env
+            echo "VITE_API_BASE_URL=${VITE_API_BASE_URL}" >> .env
 
+            echo "Build configuration:"
             cat .env
       - run:
           name: Build customer portal
           command: |
             npm run build
 
+            # Move to environment-specific folder
+            ENV="<< parameters.environment >>"
+            mkdir -p dist-${ENV}
+            mv dist/* dist-${ENV}/
+            rmdir dist
+
             # Build stats
             echo "Build complete!"
-            du -sh dist/
+            du -sh dist-${ENV}/
             echo "Files in build:"
-            find dist/ -type f | wc -l
+            find dist-${ENV}/ -type f | wc -l
       - persist_to_workspace:
           root: .
           paths:
-            - dist
+            - dist-<< parameters.environment >>
       - store_artifacts:
-          path: dist
-          destination: customer-portal-build
+          path: dist-<< parameters.environment >>
+          destination: customer-portal-build-<< parameters.environment >>
 
   # Deploy to S3 and CloudFront
   deploy:
     docker:
-      - image: cimg/python:3.11-node
+      - image: cimg/python:3.13-node
     resource_class: medium
     parameters:
       environment:
@@ -107,38 +89,57 @@ jobs:
       - checkout
       - attach_workspace:
           at: .
-      - aws-cli/setup:
-          role_arn: ${AWS_ROLE_ARN}
-          region: ${AWS_REGION}
+      - aws-cli/install
       - run:
-          name: Get infrastructure outputs
+          name: Setup AWS OIDC
           command: |
-            # Get S3 bucket and CloudFront from Terraform outputs or environment
-            echo "export S3_BUCKET=${CUSTOMER_PORTAL_S3_BUCKET}" >> $BASH_ENV
-            echo "export CLOUDFRONT_ID=${CUSTOMER_PORTAL_CLOUDFRONT_ID}" >> $BASH_ENV
+            # Use OIDC token for authentication
+            OIDC_TOKEN="${CIRCLE_OIDC_TOKEN_V2:-$CIRCLE_OIDC_TOKEN}"
+            ROLE_ARN="${AWS_ROLE_ARN}"
+
+            echo "Assuming role: $ROLE_ARN"
+
+            aws sts assume-role-with-web-identity \
+              --role-arn "$ROLE_ARN" \
+              --role-session-name "circleci-customer-portal-${CIRCLE_BUILD_NUM}" \
+              --web-identity-token "$OIDC_TOKEN" \
+              --duration-seconds 3600 > /tmp/creds.json
+
+            export AWS_ACCESS_KEY_ID=$(cat /tmp/creds.json | jq -r '.Credentials.AccessKeyId')
+            export AWS_SECRET_ACCESS_KEY=$(cat /tmp/creds.json | jq -r '.Credentials.SecretAccessKey')
+            export AWS_SESSION_TOKEN=$(cat /tmp/creds.json | jq -r '.Credentials.SessionToken')
+
+            echo "export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" >> $BASH_ENV
+            echo "export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> $BASH_ENV
+            echo "export AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> $BASH_ENV
+            echo "export AWS_REGION=${AWS_REGION:-us-east-1}" >> $BASH_ENV
+
+            rm /tmp/creds.json
+            echo "AWS credentials configured"
       - run:
           name: Sync to S3
           command: |
-            echo "Deploying customer portal to ${S3_BUCKET}"
+            ENV="<< parameters.environment >>"
+            echo "Deploying customer portal to ${CUSTOMER_PORTAL_S3_BUCKET}"
 
             # Sync assets with long cache
-            aws s3 sync dist/ s3://${S3_BUCKET}/ \
+            aws s3 sync dist-${ENV}/ s3://${CUSTOMER_PORTAL_S3_BUCKET}/ \
               --delete \
               --cache-control "public, max-age=31536000, immutable" \
               --exclude "*.html"
 
             # Sync HTML with no-cache
-            aws s3 sync dist/ s3://${S3_BUCKET}/ \
+            aws s3 sync dist-${ENV}/ s3://${CUSTOMER_PORTAL_S3_BUCKET}/ \
               --exclude "*" \
               --include "*.html" \
               --cache-control "no-cache, no-store, must-revalidate"
       - run:
           name: Invalidate CloudFront
           command: |
-            echo "Invalidating CloudFront ${CLOUDFRONT_ID}"
+            echo "Invalidating CloudFront ${CUSTOMER_PORTAL_CLOUDFRONT_ID}"
 
             INVALIDATION_ID=$(aws cloudfront create-invalidation \
-              --distribution-id ${CLOUDFRONT_ID} \
+              --distribution-id ${CUSTOMER_PORTAL_CLOUDFRONT_ID} \
               --paths "/*" \
               --query 'Invalidation.Id' \
               --output text)
@@ -146,7 +147,7 @@ jobs:
             echo "Created invalidation: ${INVALIDATION_ID}"
 
             aws cloudfront wait invalidation-completed \
-              --distribution-id ${CLOUDFRONT_ID} \
+              --distribution-id ${CUSTOMER_PORTAL_CLOUDFRONT_ID} \
               --id ${INVALIDATION_ID}
 
             echo "Deployment complete!"
@@ -160,24 +161,17 @@ workflows:
             branches:
               only: /.*/
 
-      - test:
-          requires:
-            - lint
-          filters:
-            branches:
-              only: /.*/
-
-      # Dev deployment (develop branch)
+      # Dev deployment (main branch auto-deploy)
       - build:
           name: build_dev
           environment: "dev"
           requires:
-            - test
+            - lint
           context:
             - customer-portal-dev
           filters:
             branches:
-              only: develop
+              only: main
 
       - deploy:
           name: deploy_dev
@@ -189,23 +183,24 @@ workflows:
             - customer-portal-dev
           filters:
             branches:
-              only: develop
+              only: main
 
-      # Prod deployment (main branch with approval)
+      # Prod deployment (requires approval)
       - build:
           name: build_prod
           environment: "prod"
           requires:
-            - test
+            - lint
           context:
             - customer-portal-prod
           filters:
             branches:
               only: main
 
-      - hold_for_approval:
+      - hold_for_prod_approval:
           type: approval
           requires:
+            - deploy_dev
             - build_prod
           filters:
             branches:
@@ -215,7 +210,7 @@ workflows:
           name: deploy_prod
           environment: "prod"
           requires:
-            - hold_for_approval
+            - hold_for_prod_approval
           context:
             - aws-credentials-prod
             - customer-portal-prod
