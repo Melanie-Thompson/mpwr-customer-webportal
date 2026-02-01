@@ -1,6 +1,7 @@
-import { BrowserRouter, Routes, Route, Navigate, useSearchParams } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useEffect } from 'react';
 import useStore from './store/useStore';
+import { AuthProvider, useAuth } from './context/AuthContext';
 
 // Layout
 import Layout from './components/Layout/Layout';
@@ -11,37 +12,38 @@ import Loans from './pages/Loans/Loans';
 import Documents from './pages/Documents/Documents';
 import Payments from './pages/Payments/Payments';
 import Profile from './pages/Profile/Profile';
+import Login from './pages/Login/Login';
 
-// Component that reads customer ID from URL and loads data
-const AppContent = () => {
-  const [searchParams] = useSearchParams();
-  const { loadCustomerData, dataLoaded, isLoading, error, setCustomerId, customerId } = useStore();
+// Protected route wrapper
+const ProtectedRoute = ({ children }) => {
+  const { isAuthenticated, isLoading } = useAuth();
 
-  useEffect(() => {
-    // Get customer ID from URL query param
-    const urlCustomerId = searchParams.get('customer_id') || searchParams.get('customerId');
-
-    if (urlCustomerId && urlCustomerId !== customerId) {
-      setCustomerId(urlCustomerId);
-    }
-  }, [searchParams, customerId, setCustomerId]);
-
-  useEffect(() => {
-    if (!dataLoaded && customerId) {
-      loadCustomerData();
-    }
-  }, [dataLoaded, customerId, loadCustomerData]);
-
-  // No customer ID provided in URL
-  if (!customerId) {
+  if (isLoading) {
     return (
-      <div className="app-error">
-        <h2>Customer ID Required</h2>
-        <p>Please provide a customer_id in the URL query parameter.</p>
-        <code>?customer_id=your_customer_id</code>
+      <div className="app-loading">
+        <div className="loading-spinner" />
+        <p>Checking authentication...</p>
       </div>
     );
   }
+
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return children;
+};
+
+// Component that loads customer data after authentication
+const AuthenticatedContent = () => {
+  const { loadCustomerData, dataLoaded, isLoading, error } = useStore();
+  const { user } = useAuth();
+
+  useEffect(() => {
+    if (!dataLoaded && user) {
+      loadCustomerData();
+    }
+  }, [dataLoaded, user, loadCustomerData]);
 
   if (isLoading) {
     return (
@@ -78,10 +80,29 @@ const AppContent = () => {
   );
 };
 
+// Main app content with routing
+const AppContent = () => {
+  return (
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route
+        path="/*"
+        element={
+          <ProtectedRoute>
+            <AuthenticatedContent />
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
+  );
+};
+
 function App() {
   return (
     <BrowserRouter>
-      <AppContent />
+      <AuthProvider>
+        <AppContent />
+      </AuthProvider>
     </BrowserRouter>
   );
 }

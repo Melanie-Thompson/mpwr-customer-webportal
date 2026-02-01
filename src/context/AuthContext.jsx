@@ -7,6 +7,7 @@ import {
   confirmSignIn,
 } from 'aws-amplify/auth';
 import useStore from '../store/useStore';
+import { setAuthToken } from '../api/client';
 
 const AuthContext = createContext(null);
 
@@ -42,6 +43,12 @@ export const AuthProvider = ({ children }) => {
       if (currentUser && session.tokens) {
         setUser(currentUser);
         setIsAuthenticated(true);
+
+        // Set the auth token on the API client
+        const idToken = session.tokens.idToken?.toString();
+        if (idToken) {
+          setAuthToken(idToken);
+        }
 
         // Extract customer ID from user attributes or username
         const customerId = currentUser.username || currentUser.userId;
@@ -139,6 +146,7 @@ export const AuthProvider = ({ children }) => {
       setChallengeName(null);
       setChallengeUser(null);
       setStoreUser(null);
+      setAuthToken(null); // Clear the API auth token
     } catch (error) {
       console.error('Sign out error:', error);
     }
